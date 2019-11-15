@@ -1,0 +1,62 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.hive.jdbc;
+
+import java.io.UnsupportedEncodingException;
+import java.nio.charset.Charset;
+import java.security.NoSuchAlgorithmException;
+import java.util.List;
+
+public class ServiceWatch {
+    public ServiceWatch(ConsistentHash consistentHash, String dir)
+            throws ZooKeeperHiveClientException, UnsupportedEncodingException, NoSuchAlgorithmException {
+        ZooKeeperManager zkManager = ZooKeeperHiveClientHelper.getZkManager();
+        if (zkManager == null) {
+            throw new ZooKeeperHiveClientException("ZooKeeperManager has not been initialized");
+        }
+
+        List<String> nodes = ZooKeeperHiveClientHelper.getZkManager().getChildren(dir);
+        for (String node: nodes) {
+            consistentHash.addNode(node);
+        }
+
+        PathChildrenCacheEventHandler addNodeHandler = new PathChildrenCacheEventHandler() {
+            @Override
+            public void handleEvent(String path, byte[] data) {
+                try {
+                    String dataStr = new String(data, Charset.forName("UTF-8"));
+                    consistentHash.addNode(dataStr);
+                } catch (UnsupportedEncodingException|NoSuchAlgorithmException e) {
+                    System.exit(1);
+                }
+            }
+        };
+
+        PathChildrenCacheEventHandler removeNodeHandler = new PathChildrenCacheEventHandler() {
+            @Override
+            public void handleEvent(String path, byte[] data) {
+                String dataStr = new String(data, Charset.forName("UTF-8"));
+                consistentHash.removeNode(dataStr);
+            }
+        };
+
+        zkManager.watchAddNode(dir, addNodeHandler);
+        zkManager.watchRemoveNode(dir, removeNodeHandler);
+    }
+}

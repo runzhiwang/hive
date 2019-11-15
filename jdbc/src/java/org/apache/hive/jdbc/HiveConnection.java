@@ -20,7 +20,9 @@ package org.apache.hive.jdbc;
 
 import java.io.FileInputStream;
 import java.io.IOException;
+import java.io.UnsupportedEncodingException;
 import java.security.KeyStore;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.sql.Array;
 import java.sql.Blob;
@@ -122,6 +124,8 @@ public class HiveConnection implements java.sql.Connection {
   private final List<TProtocolVersion> supportedProtocols = new LinkedList<TProtocolVersion>();
   private int loginTimeout = 0;
   private TProtocolVersion protocol;
+  private ConsistentHash consistentHash;
+  private ServiceWatch serviceWatch;
 
   public HiveConnection(String uri, Properties info) throws SQLException {
     setupLoginTimeout();
@@ -155,6 +159,42 @@ public class HiveConnection implements java.sql.Connection {
     }
 
     isEmbeddedMode = connParams.isEmbeddedMode();
+
+    String discoveryMode = sessConfMap.get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE);
+    if ((discoveryMode != null)
+            && (JdbcConnectionParams.MULTI_ACTIVE_SERVICE_DISCOVERY_MODE_ZOOKEEPER.equalsIgnoreCase(discoveryMode))) {
+      try {
+        ZooKeeperHiveClientHelper.initZkManager(connParams);
+      } catch (ZooKeeperHiveClientException e) {
+        System.exit(1);
+      }
+
+
+      String zooKeeperNamespace =
+              connParams.getSessionVars().get(JdbcConnectionParams.ZOOKEEPER_NAMESPACE);
+
+      try {
+        String configPath = getZkPath(zooKeeperNamespace + "/config");
+        ZooKeeperManager zkManager = ZooKeeperHiveClientHelper.getZkManager();
+        Map<String, String> kvConfig = zkManager.getKVData(configPath);
+        String replicateStr = kvConfig.get(Utils.MULTI_ACTIVE_CONSISTENT_HASH_REPLICATE_NUM);
+        if (replicateStr == null) {
+          System.exit(1);
+        }
+
+        int replicateNum = Integer.parseInt(replicateStr);
+        consistentHash = new ConsistentHash(replicateNum);
+      } catch (ZooKeeperHiveClientException e) {
+        System.exit(1);
+      }
+
+      try {
+        String servicePath = getZkPath(zooKeeperNamespace + "/service");
+        serviceWatch = new ServiceWatch(consistentHash, servicePath);
+      } catch (ZooKeeperHiveClientException | UnsupportedEncodingException | NoSuchAlgorithmException e) {
+        System.exit(1);
+      }
+    }
 
     if (isEmbeddedMode) {
       EmbeddedThriftBinaryCLIService embeddedClient = new EmbeddedThriftBinaryCLIService();
@@ -190,6 +230,21 @@ public class HiveConnection implements java.sql.Connection {
 
     // open client session
     openSession();
+  }
+
+  private String getZkPath(String path) {
+    while (path.contains("//")) {
+      path = path.replaceAll("//", "/");
+    }
+
+    if (path.endsWith("/")) {
+      path = path.substring(0, path.length() - 1);
+    }
+    return path;
+  }
+
+  private void openTransportByConsistentHash() {
+
   }
 
   private void openTransport() throws SQLException {

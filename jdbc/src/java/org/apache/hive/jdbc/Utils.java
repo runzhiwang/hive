@@ -63,6 +63,9 @@ public class Utils {
   static final String HIVE_SERVER2_RETRY_TRUE = "true";
   static final String HIVE_SERVER2_RETRY_FALSE = "false";
 
+  static final String MULTI_ACTIVE_CONSISTENT_HASH_REPLICATE_NUM = "hive.server2.mult-active.replicateNum";
+  static final String MULTI_ACTIVE_NEXT_SESSION_ID_PATH = "hive.server2.multi-active.nextSessionIdPath";
+
   public static class JdbcConnectionParams {
     // Note on client side parameter naming convention:
     // Prefer using a shorter camelCase param name instead of using the same name as the
@@ -101,6 +104,7 @@ public class Utils {
     static final String SERVICE_DISCOVERY_MODE_NONE = "none";
     // Use ZooKeeper for indirection while using dynamic service discovery
     static final String SERVICE_DISCOVERY_MODE_ZOOKEEPER = "zooKeeper";
+    static final String MULTI_ACTIVE_SERVICE_DISCOVERY_MODE_ZOOKEEPER = "multiActiveZooKeeper";
     static final String ZOOKEEPER_NAMESPACE = "zooKeeperNamespace";
     // Default namespace value on ZooKeeper.
     // This value is used if the param "zooKeeperNamespace" is not specified in the JDBC Uri.
