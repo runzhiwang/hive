@@ -45,6 +45,7 @@ import org.apache.hive.service.cli.thrift.TSessionHandle;
 import org.apache.hive.service.cli.thrift.TFetchResultsReq;
 import org.apache.hive.service.cli.thrift.TFetchResultsResp;
 import org.apache.hive.service.cli.thrift.TFetchOrientation;
+import org.apache.thrift.transport.TTransportException;
 
 /**
  * HiveStatement.
@@ -249,19 +250,51 @@ public class HiveStatement implements java.sql.Statement {
     execReq.setConfOverlay(sessConf);
 
     transportLock.lock();
-    try {
-      TExecuteStatementResp execResp = client.ExecuteStatement(execReq);
-      Utils.verifySuccessWithInfo(execResp.getStatus());
-      stmtHandle = execResp.getOperationHandle();
-      isExecuteStatementFailed = false;
-    } catch (SQLException eS) {
-      isExecuteStatementFailed = true;
-      throw eS;
-    } catch (Exception ex) {
-      isExecuteStatementFailed = true;
-      throw new SQLException(ex.toString(), "08S01", ex);
-    } finally {
+
+    if (connection.isMultiActiveOpen()) {
+      int tryTimes = 0;
+      while (tryTimes ++ < Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+        try {
+          TExecuteStatementResp execResp = client.ExecuteStatement(execReq);
+          Utils.verifySuccessWithInfo(execResp.getStatus());
+          stmtHandle = execResp.getOperationHandle();
+          isExecuteStatementFailed = false;
+          System.err.println("wangjie execte statement sql:" + sql + " successfully with multi-active mode");
+          break;
+        } catch (Exception e) {
+          try {
+            Thread.sleep(Utils.MULTI_ACTIVE_TRY_INTERVAL_MS);
+            connection.createClientWithMultiActive();
+          } catch (InterruptedException | TTransportException ex) {
+            isExecuteStatementFailed = true;
+            break;
+          }
+        }
+      }
+
       transportLock.unlock();
+      if (tryTimes >= Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+        isExecuteStatementFailed = true;
+      }
+
+      if (isExecuteStatementFailed) {
+        throw new SQLException("execute sql failed with multi-active mode");
+      }
+    } else {
+      try {
+        TExecuteStatementResp execResp = client.ExecuteStatement(execReq);
+        Utils.verifySuccessWithInfo(execResp.getStatus());
+        stmtHandle = execResp.getOperationHandle();
+        isExecuteStatementFailed = false;
+      } catch (SQLException eS) {
+        isExecuteStatementFailed = true;
+        throw eS;
+      } catch (Exception ex) {
+        isExecuteStatementFailed = true;
+        throw new SQLException(ex.toString(), "08S01", ex);
+      } finally {
+        transportLock.unlock();
+      }
     }
 
     TGetOperationStatusReq statusReq = new TGetOperationStatusReq(stmtHandle);

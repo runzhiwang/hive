@@ -122,6 +122,9 @@ public class HiveConnection implements java.sql.Connection {
   private final List<TProtocolVersion> supportedProtocols = new LinkedList<TProtocolVersion>();
   private int loginTimeout = 0;
   private TProtocolVersion protocol;
+  private int sessionId;
+  private boolean isServiceDiscoveryOpen;
+  private boolean isMultiActiveOpen;
 
   public HiveConnection(String uri, Properties info) throws SQLException {
     setupLoginTimeout();
@@ -172,10 +175,8 @@ public class HiveConnection implements java.sql.Connection {
       if (info.containsKey(JdbcConnectionParams.AUTH_TYPE)) {
         sessConfMap.put(JdbcConnectionParams.AUTH_TYPE, info.getProperty(JdbcConnectionParams.AUTH_TYPE));
       }
-      // open the client transport
-      openTransport();
-      // set up the client
-      client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+      createClient();
     }
 
     // add supported protocols
@@ -188,8 +189,26 @@ public class HiveConnection implements java.sql.Connection {
     supportedProtocols.add(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7);
     supportedProtocols.add(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V8);
 
-    // open client session
-    openSession();
+    isServiceDiscoveryOpen = Utils.isServiceDiscoveryOpen(sessConfMap);
+    isMultiActiveOpen = Utils.isMultiActiveOpen(sessConfMap);
+
+    if (isMultiActiveOpen){
+      openSessionWithMultiActive();
+    } else {
+      // open client session
+      openSession();
+    }
+  }
+
+  private void createClient() throws SQLException {
+    // open the client transport
+    openTransport();
+    // set up the client
+    client = new TCLIService.Client(new TBinaryProtocol(transport));
+  }
+
+  public boolean isMultiActiveOpen() {
+    return isMultiActiveOpen;
   }
 
   private void openTransport() throws SQLException {
@@ -207,9 +226,7 @@ public class HiveConnection implements java.sql.Connection {
       } catch (TTransportException e) {
         LOG.info("Could not open client transport with JDBC Uri: " + jdbcUriString);
         // We'll retry till we exhaust all HiveServer2 uris from ZooKeeper
-        if ((sessConfMap.get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE) != null)
-            && (JdbcConnectionParams.SERVICE_DISCOVERY_MODE_ZOOKEEPER.equalsIgnoreCase(sessConfMap
-                .get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE)))) {
+        if (isServiceDiscoveryOpen) {
           try {
             // Update jdbcUriString, host & port variables in connParams
             // Throw an exception if all HiveServer2 uris have been exhausted,
@@ -550,6 +567,153 @@ public class HiveConnection implements java.sql.Connection {
     return tokenStr;
   }
 
+  private void openSessionWithMultiActive() {
+    getNextSessionIdWithMultiActive();
+
+    int tryTimes = 0;
+    while (tryTimes ++ < Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      try {
+        createClientWithMultiActive();
+        openSession();
+        LOG.info("Open session with multi-active mode successfully session id: " + sessionId +
+                " thrift address: " + host + ":" + port);
+        return;
+      } catch(SQLException | TTransportException e) {
+        LOG.error("Fail to open session on " + host + ":" + port);
+      }
+
+      try {
+        Thread.sleep(Utils.MULTI_ACTIVE_TRY_INTERVAL_MS);
+      } catch (InterruptedException e) {
+        System.exit(1);
+      }
+    }
+
+    if (tryTimes >= Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      LOG.error("Fail to open session with multi-active mode");
+      System.exit(1);
+    }
+  }
+
+  public void createClientWithMultiActive() throws SQLException, TTransportException {
+    String thriftAddr = getThriftAddrWithMultiActive(sessionId);
+    String[] words = thriftAddr.split(":");
+    host = words[0];
+    port = Integer.parseInt(words[1]);
+
+    transport = isHttpTransportMode() ? createHttpTransport() : createBinaryTransport();
+    if (!transport.isOpen()) {
+      LOG.info("Will try to open client transport with JDBC Uri: " + jdbcUriString);
+      transport.open();
+    }
+
+    // set up the client
+    client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+    LOG.info("Create client successfully with thrift " + host + ":" + port);
+  }
+
+
+  private void getNextSessionIdWithMultiActive() {
+    TOpenSessionReq openReq = new TOpenSessionReq();
+    Map<String, String> openConf = new HashMap<String, String>();
+    openConf.put(Utils.MULTI_ACTIVE_REQ_TYPE, Utils.MULTI_ACTIVE_GET_NEXT_SESSION_ID);
+    openReq.setConfiguration(openConf);
+
+    int tryTimes = 0;
+    while (tryTimes ++ < Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      try {
+        TOpenSessionResp openResp = client.OpenSession(openReq);
+
+        if (!supportedProtocols.contains(openResp.getServerProtocolVersion())) {
+          throw new TException("Unsupported Hive2 protocol");
+        }
+
+        // validate connection
+        Utils.verifySuccess(openResp.getStatus());
+
+        String nextSessionIdStr = openResp.getConfiguration().get(Utils.MULTI_ACTIVE_NEXT_SESSION_ID);
+        if (nextSessionIdStr == null) {
+          throw new TException("nextSessionId is empty");
+        }
+
+        sessionId = Integer.parseInt(nextSessionIdStr);
+        LOG.info("Get next session id: " + nextSessionIdStr + " successfully with multi-active mode");
+        return;
+      } catch (TException | SQLException e) {
+        LOG.error("Could not get nextSessionId from: " + host + ":" + port, e);
+        try {
+          createClient();
+        } catch (SQLException err) {
+          LOG.error("Could not connect to any thrift server");
+          System.exit(1);
+        }
+      }
+
+      try {
+        Thread.sleep(Utils.MULTI_ACTIVE_TRY_INTERVAL_MS);
+      } catch (InterruptedException e) {
+        System.exit(1);
+      }
+    }
+
+    if (tryTimes >= Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      LOG.error("Fail to get next session id with multi-active mode");
+      System.exit(1);
+    }
+  }
+
+  private String getThriftAddrWithMultiActive(int sessionId) {
+    TOpenSessionReq openReq = new TOpenSessionReq();
+    Map<String, String> openConf = new HashMap<String, String>();
+    openConf.put(Utils.MULTI_ACTIVE_REQ_TYPE, Utils.MULTI_ACTIVE_GET_THRIFT_ADDR);
+    openConf.put(Utils.MULTI_ACTIVE_NEXT_SESSION_ID, String.valueOf(sessionId));
+    openReq.setConfiguration(openConf);
+
+    int tryTimes = 0;
+    while (tryTimes ++ < Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      try {
+        TOpenSessionResp openResp = client.OpenSession(openReq);
+
+        if (!supportedProtocols.contains(openResp.getServerProtocolVersion())) {
+          throw new TException("Unsupported Hive2 protocol");
+        }
+
+        // validate connection
+        Utils.verifySuccess(openResp.getStatus());
+
+        String thriftAddr = openResp.getConfiguration().get(Utils.MULTI_ACTIVE_THRIFT_ADDR);
+        if (thriftAddr == null) {
+          throw new TException("thriftAddr is empty");
+        }
+
+        LOG.info("Get thrift address: " + thriftAddr + " successfully with multi-active mode");
+        return thriftAddr;
+      } catch (TException | SQLException e) {
+        LOG.error("Could not get thriftAddr from: " + host + ":" + port, e);
+        try {
+          createClient();
+        } catch (SQLException err) {
+          LOG.error("Could not connect to any thrift server ", err);
+          System.exit(1);
+        }
+      }
+
+      try {
+        Thread.sleep(Utils.MULTI_ACTIVE_TRY_INTERVAL_MS);
+      } catch (InterruptedException e) {
+        System.exit(1);
+      }
+    }
+
+    if (tryTimes >= Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      LOG.error("fail to get thrift address with multi-active mode");
+      System.exit(1);
+    }
+
+    return null;
+  }
+
   private void openSession() throws SQLException {
     TOpenSessionReq openReq = new TOpenSessionReq();
 
@@ -564,6 +728,10 @@ public class HiveConnection implements java.sql.Connection {
     }
     // switch the database
     openConf.put("use:database", connParams.getDbName());
+
+    if (isMultiActiveOpen) {
+      openConf.put("livy.thrift.nextSessionId", String.valueOf(sessionId));
+    }
 
     // set the session configuration
     Map<String, String> sessVars = connParams.getSessionVars();
