@@ -39,12 +39,8 @@ import java.sql.SQLXML;
 import java.sql.Savepoint;
 import java.sql.Statement;
 import java.sql.Struct;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.Properties;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
@@ -54,6 +50,7 @@ import javax.net.ssl.TrustManagerFactory;
 import javax.security.sasl.Sasl;
 import javax.security.sasl.SaslException;
 
+import org.apache.hive.service.cli.HiveSQLException;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.protocol.HttpContext;
 import org.apache.commons.logging.Log;
@@ -122,6 +119,9 @@ public class HiveConnection implements java.sql.Connection {
   private final List<TProtocolVersion> supportedProtocols = new LinkedList<TProtocolVersion>();
   private int loginTimeout = 0;
   private TProtocolVersion protocol;
+  private int sessionId = -1;
+  private boolean isServiceDiscoveryOpen;
+  private boolean isMultiActiveOpen;
 
   public HiveConnection(String uri, Properties info) throws SQLException {
     setupLoginTimeout();
@@ -172,10 +172,8 @@ public class HiveConnection implements java.sql.Connection {
       if (info.containsKey(JdbcConnectionParams.AUTH_TYPE)) {
         sessConfMap.put(JdbcConnectionParams.AUTH_TYPE, info.getProperty(JdbcConnectionParams.AUTH_TYPE));
       }
-      // open the client transport
-      openTransport();
-      // set up the client
-      client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+      createClient();
     }
 
     // add supported protocols
@@ -188,8 +186,26 @@ public class HiveConnection implements java.sql.Connection {
     supportedProtocols.add(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V7);
     supportedProtocols.add(TProtocolVersion.HIVE_CLI_SERVICE_PROTOCOL_V8);
 
-    // open client session
-    openSession();
+    isServiceDiscoveryOpen = Utils.isServiceDiscoveryOpen(sessConfMap);
+    isMultiActiveOpen = Utils.isMultiActiveOpen(sessConfMap);
+
+    if (isMultiActiveOpen){
+      openSessionWithMultiActive();
+    } else {
+      // open client session
+      openSession();
+    }
+  }
+
+  private void createClient() throws SQLException {
+    // open the client transport
+    openTransport();
+    // set up the client
+    client = new TCLIService.Client(new TBinaryProtocol(transport));
+  }
+
+  public boolean isMultiActiveOpen() {
+    return isMultiActiveOpen;
   }
 
   private void openTransport() throws SQLException {
@@ -207,9 +223,7 @@ public class HiveConnection implements java.sql.Connection {
       } catch (TTransportException e) {
         LOG.info("Could not open client transport with JDBC Uri: " + jdbcUriString);
         // We'll retry till we exhaust all HiveServer2 uris from ZooKeeper
-        if ((sessConfMap.get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE) != null)
-            && (JdbcConnectionParams.SERVICE_DISCOVERY_MODE_ZOOKEEPER.equalsIgnoreCase(sessConfMap
-                .get(JdbcConnectionParams.SERVICE_DISCOVERY_MODE)))) {
+        if (isServiceDiscoveryOpen) {
           try {
             // Update jdbcUriString, host & port variables in connParams
             // Throw an exception if all HiveServer2 uris have been exhausted,
@@ -550,6 +564,50 @@ public class HiveConnection implements java.sql.Connection {
     return tokenStr;
   }
 
+  private void openSessionWithMultiActive() throws SQLException {
+    int tryTimes = 0;
+    while (tryTimes ++ < Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      try {
+        openSession();
+        return;
+      } catch(SQLException e) {
+        if (e instanceof HiveSQLException) {
+          if (e.getErrorCode() == Utils.MULTI_ACTIVE_REDIRECT_CODE) {
+            // redirect
+            Map<String, String> map = parseRedirectMsg(e.getMessage());
+            sessionId = Integer.parseInt(map.get(Utils.MULTI_ACTIVE_SESSION_ID_RESP));
+            String[] thriftAddr = map.get(Utils.MULTI_ACTIVE_THRIFT_ADDR).split(":");
+            host = thriftAddr[0];
+            port = Integer.parseInt(thriftAddr[1]);
+            try { createClientWithMultiActive(); } catch (Exception ex) {}
+          } else {
+            throw new SQLException("Fail to open session with multi-active mode");
+          }
+        } else {
+          // the connection has been closed, so create client connected to random thrift server
+          createClient();
+        }
+      }
+    }
+
+    if (tryTimes >= Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      throw new SQLException("Fail to open session with multi-active mode");
+    }
+  }
+
+  public void createClientWithMultiActive() throws SQLException, TTransportException {
+    transport = isHttpTransportMode() ? createHttpTransport() : createBinaryTransport();
+    if (!transport.isOpen()) {
+      LOG.info("Will try to open client transport with JDBC Uri: " + jdbcUriString);
+      transport.open();
+    }
+
+    // set up the client
+    client = new TCLIService.Client(new TBinaryProtocol(transport));
+
+    LOG.info("Create client successfully with thrift " + host + ":" + port);
+  }
+
   private void openSession() throws SQLException {
     TOpenSessionReq openReq = new TOpenSessionReq();
 
@@ -564,6 +622,11 @@ public class HiveConnection implements java.sql.Connection {
     }
     // switch the database
     openConf.put("use:database", connParams.getDbName());
+
+    if (isMultiActiveOpen && sessionId != -1) {
+      openConf.put(Utils.MULTI_ACTIVE_REQ_TYPE, Utils.MULTI_ACTIVE_REQ_TYPE_CREATE_SESSION);
+      openConf.put(Utils.MULTI_ACTIVE_SESSION_ID_REQ, String.valueOf(sessionId));
+    }
 
     // set the session configuration
     Map<String, String> sessVars = connParams.getSessionVars();
@@ -595,6 +658,58 @@ public class HiveConnection implements java.sql.Connection {
           + jdbcUriString + ": " + e.getMessage(), " 08S01", e);
     }
     isClosed = false;
+  }
+
+  private Map<String, String> parseRedirectMsg(String str) {
+    Map<String, String> map = new TreeMap<>();
+    String[] items = str.split(";");
+    for (String item : items) {
+      String[] words = item.split("=");
+      map.put(words[0], words[1]);
+    }
+    return map;
+  }
+
+  void askThriftAddrAndCreateClient() throws SQLException {
+    TOpenSessionReq openReq = new TOpenSessionReq();
+
+    Map<String, String> openConf = new HashMap<String, String>();
+
+    openConf.put(Utils.MULTI_ACTIVE_REQ_TYPE, Utils.MULTI_ACTIVE_REQ_TYPE_ASK_THRIFT_ADDR);
+    openConf.put(Utils.MULTI_ACTIVE_SESSION_ID_REQ, String.valueOf(sessionId));
+
+    openReq.setConfiguration(openConf);
+    int tryTimes = 0;
+    while (tryTimes ++ < Utils.MULTI_ACTIVE_MAX_TRY_TIMES) {
+      try {
+        TOpenSessionResp openResp = client.OpenSession(openReq);
+        Map<String, String> map = parseRedirectMsg(openResp.getStatus().getErrorMessage());
+        String thriftAddr = map.get(Utils.MULTI_ACTIVE_THRIFT_ADDR);
+        String[] words = thriftAddr.split(":");
+        host = words[0];
+        port = Integer.parseInt(words[1]);
+        createClientWithMultiActive();
+        break;
+      } catch (TException | SQLException e) {
+        createClient();
+      }
+    }
+  }
+
+  void processReqException(Exception e) throws SQLException {
+    if (e instanceof TException) {
+      // connection has closed, create a client
+      askThriftAddrAndCreateClient();
+    } else if (e instanceof HiveSQLException) {
+      HiveSQLException ex = (HiveSQLException) e;
+      if (ex.getErrorCode() == Utils.MULTI_ACTIVE_REDIRECT_CODE) {
+        // redirect
+        askThriftAddrAndCreateClient();
+      } else {
+        // connect to right thrift, but return error
+        throw new SQLException();
+      }
+    }
   }
 
   /**
